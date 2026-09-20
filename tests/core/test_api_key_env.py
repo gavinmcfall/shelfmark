@@ -92,32 +92,29 @@ def wired(main_module, user_db, monkeypatch):
         yield main_module
 
 
-@pytest.fixture
-def real_user_db(main_module):
-    """The UserDB main_module's self-service routes closed over at registration time.
-
-    Unlike the isolated ``user_db``/``wired`` fixtures (a fresh temp DB
-    monkeypatched onto ``main_module.user_db``), routes registered by
-    ``register_self_user_routes`` keep their own reference to the UserDB
-    passed in at import time, so tests that need those routes to see admin
-    changes must write through this same instance. Any user created during
-    the test is deleted again on teardown so state doesn't leak between
-    tests sharing this module-scoped app.
-    """
-    db = main_module.user_db
-    existing_ids = {user["id"] for user in db.list_users()}
-    yield db
-    for user in db.list_users():
-        if user["id"] not in existing_ids:
-            db.delete_user(user["id"])
-
-
 def _bearer(value):
     return {"Authorization": f"Bearer {value}"}
 
 
 def _x_api_key(value):
     return {"X-Api-Key": value}
+
+
+def _identity_for_key(wired):
+    """Run the middleware directly against the isolated `user_db` and return the resulting session.
+
+    Going through a real request/response round trip would need a route
+    that reveals identity, and the only such route (`/api/users/me/edit-context`)
+    is closed over the real per-worker `users.db` at registration time, not
+    the isolated temp DB the `wired` fixture monkeypatches onto
+    `main_module.user_db` -- so it can't see admins created here. Calling
+    the middleware in a request context sidesteps that entirely.
+    """
+    with wired.app.test_request_context("/api/downloads/active", headers=_bearer("s3cret")):
+        assert wired.api_key_auth_middleware() is None
+        from flask import session
+
+        return dict(session)
 
 
 def _cookie_client(app, user, *, is_admin=False, permanent=False):
@@ -329,46 +326,48 @@ class TestScopeAndModes:
 
 
 class TestIdentityAndRouting:
-    def test_deleted_first_admin_changes_identity(self, main_module, real_user_db, monkeypatch):
-        monkeypatch.setattr(api_key, "API_KEY", "s3cret")
-        root = real_user_db.create_user(username="root", role="admin")
-        second = real_user_db.create_user(username="second", role="admin")
+    def test_deleted_first_admin_changes_identity(self, wired, user_db):
+        root = user_db.create_user(username="root", role="admin")
+        root2 = user_db.create_user(username="root2", role="admin")
 
-        with patch.object(main_module, "get_auth_mode", return_value="builtin"):
-            client = main_module.app.test_client()
+        identity = _identity_for_key(wired)
+        assert identity["user_id"] == "root"
+        assert identity["db_user_id"] == root["id"]
+        assert identity["is_admin"] is True
 
-            response = client.get("/api/users/me/edit-context", headers=_bearer("s3cret"))
-            assert response.status_code == 200
-            assert response.get_json()["user"]["username"] == "root"
+        user_db.delete_user(root["id"])
 
-            real_user_db.delete_user(root["id"])
+        identity = _identity_for_key(wired)
+        assert identity["user_id"] == "root2"
+        assert identity["db_user_id"] == root2["id"]
 
-            response = client.get("/api/users/me/edit-context", headers=_bearer("s3cret"))
-            assert response.status_code == 200
-            assert response.get_json()["user"]["username"] == "second"
+        user_db.delete_user(root2["id"])
 
-            real_user_db.delete_user(second["id"])
+        # No admin row left at all; the key still authenticates a bare
+        # admin identity for routes that don't need a local user row.
+        identity = _identity_for_key(wired)
+        assert identity["user_id"] == "api"
+        assert identity["is_admin"] is True
+        assert "db_user_id" not in identity
 
-            # No admin row left at all; the key still authenticates a bare
-            # admin identity for routes that don't need a local user row.
-            response = client.get("/api/settings", headers=_bearer("s3cret"))
-            assert response.status_code == 200
+    def test_demoted_first_admin_changes_identity(self, wired, user_db):
+        root = user_db.create_user(username="root", role="admin")
 
-    def test_demoted_first_admin_changes_identity(self, main_module, real_user_db, monkeypatch):
-        monkeypatch.setattr(api_key, "API_KEY", "s3cret")
-        admin = real_user_db.create_user(username="root", role="admin")
-        real_user_db.update_user(admin["id"], role="user")
+        identity = _identity_for_key(wired)
+        assert identity["user_id"] == "root"
 
-        with patch.object(main_module, "get_auth_mode", return_value="builtin"):
-            client = main_module.app.test_client()
+        user_db.update_user(root["id"], role="user")
 
-            # Bare admin identity: no matching admin row, but still is_admin.
-            response = client.get("/api/settings", headers=_bearer("s3cret"))
-            assert response.status_code == 200
+        # No admin row left to match; the key falls back to a bare identity.
+        identity = _identity_for_key(wired)
+        assert identity["user_id"] == "api"
+        assert identity["is_admin"] is True
+        assert "db_user_id" not in identity
 
-            # No db_user_id in session, so the self-user guard rejects it.
-            response = client.get("/api/users/me/edit-context", headers=_bearer("s3cret"))
-            assert response.status_code == 403
+        # Bare admin identity still reaches a route that doesn't need a
+        # local user row.
+        response = wired.app.test_client().get("/api/settings", headers=_bearer("s3cret"))
+        assert response.status_code == 200
 
     def test_path_probes(self, wired, user_db):
         user_db.create_user(username="root", role="admin")
@@ -388,18 +387,22 @@ class TestIdentityAndRouting:
         response = client.get("/api/auth/../downloads/active", headers=_bearer("s3cret"))
         assert response.status_code == 404
 
-    def test_keyed_post_reaches_mutating_route(self, wired, user_db, tmp_path, monkeypatch):
-        """A keyed write through an admin-only settings route succeeds end to end."""
-        import shelfmark.config.env as env_module
+    def test_keyed_post_reaches_guarded_route(self, wired, user_db):
+        """A keyed POST passes the login_required guard and reaches the handler's own validation.
 
-        # Isolate the settings write from the shared session CONFIG_DIR so this
-        # test doesn't depend on (or pollute) other tests' persisted AUTH_METHOD.
-        monkeypatch.setattr(env_module, "CONFIG_DIR", str(tmp_path))
+        Uses /api/releases/inspect rather than a settings-save route: that
+        handler does no persistence at all, so this proves the request got
+        past the auth guard into real handler logic without touching the
+        process-wide Config singleton or the on-disk settings files other
+        tests (and other workers, under xdist) share.
+        """
         user_db.create_user(username="root", role="admin")
 
-        response = wired.app.test_client().put(
-            "/api/settings/security",
-            json={"AUTH_METHOD": "none", "PROXY_AUTH_LOGOUT_URL": ""},
+        response = wired.app.test_client().post(
+            "/api/releases/inspect",
+            json={},
             headers=_bearer("s3cret"),
         )
-        assert response.status_code == 200
+        assert response.status_code == 400
+        assert response.get_json() == {"error": "source_id is required"}
+        assert "Set-Cookie" not in response.headers
