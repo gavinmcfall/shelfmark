@@ -14,7 +14,7 @@ from importlib import import_module
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, NoReturn, cast
 
-from flask import Flask, jsonify, request, send_file, send_from_directory, session
+from flask import Flask, g, jsonify, request, send_file, send_from_directory, session
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -44,6 +44,7 @@ from shelfmark.config.settings import (
 )
 from shelfmark.core import search_deadline
 from shelfmark.core.activity_view_state_service import ActivityViewStateService
+from shelfmark.core.api_key import extract_api_key_candidate, matches_api_key
 from shelfmark.core.auth_modes import (
     get_auth_check_admin_status,
     is_settings_or_onboarding_path,
@@ -670,6 +671,56 @@ def _proxy_default_is_admin(db: UserDB) -> bool:
     return role == "admin"
 
 
+_API_KEY_EXEMPT_PREFIXES = ("/api/auth/",)
+_API_KEY_EXEMPT_PATHS = frozenset({"/api/health"})
+
+
+@app.before_request
+def api_key_auth_middleware() -> Response | tuple[Response, int] | None:
+    """Authenticate requests that present the configured API_KEY.
+
+    A matching key authenticates the request as an admin for this request
+    only: any session cookie is ignored and none is written back. A value that
+    does not match is ignored so bearer tokens forwarded by reverse proxies
+    keep working; the request then continues on the normal session path.
+    """
+    if not request.path.startswith("/api/"):
+        return None
+    if request.path in _API_KEY_EXEMPT_PATHS or request.path.startswith(_API_KEY_EXEMPT_PREFIXES):
+        return None
+
+    candidate = extract_api_key_candidate(
+        request.headers.get("Authorization"), request.headers.get("X-Api-Key")
+    )
+    if candidate is None:
+        return None
+
+    # Any bearer attempt must never refresh or clear the browser's session cookie.
+    g.api_key_attempt = True
+
+    if not matches_api_key(candidate):
+        return None
+    if get_auth_mode() == "none":
+        return None
+
+    try:
+        admin = user_db.get_first_admin() if user_db is not None else None
+    except _OPERATIONAL_ERRORS:
+        logger.exception("API key auth middleware error")
+        return jsonify({"error": "Authentication error"}), 500
+
+    session.clear()
+    session["user_id"] = admin["username"] if admin else "api"
+    session["is_admin"] = True
+    if admin:
+        session["db_user_id"] = admin["id"]
+    session.permanent = False
+    # Identity is per request; never persist it as a cookie.
+    session.modified = False
+    g.api_key_auth = True
+    return None
+
+
 @app.before_request
 def proxy_auth_middleware() -> Response | tuple[Response, int] | None:
     """Middleware to handle proxy authentication.
@@ -681,6 +732,10 @@ def proxy_auth_middleware() -> Response | tuple[Response, int] | None:
 
     # Only run for proxy auth mode
     if auth_mode != "proxy":
+        return None
+
+    # A request already authenticated by API_KEY needs no proxy headers.
+    if g.get("api_key_auth"):
         return None
 
     # Skip for public endpoints that don't need auth
@@ -812,6 +867,21 @@ def set_security_headers(response: Response) -> Response:
     )
     response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
     response.headers.setdefault("Cross-Origin-Embedder-Policy", "credentialless")
+    return response
+
+
+@app.after_request
+def strip_cookie_for_api_key_requests(response: Response) -> Response:
+    """Bearer attempts never mint or refresh a session cookie, even if a handler dirties the session."""
+    if g.get("api_key_attempt"):
+        # Flask's session interface writes Set-Cookie *after* every
+        # after_request hook, driven by session.modified/permanent, so popping
+        # the header alone would just have it reappear. Setting `permanent`
+        # mutates the session dict (re-marking it modified), so it must be
+        # reset before `modified`, not after.
+        session.permanent = False
+        session.modified = False
+        response.headers.pop("Set-Cookie", None)
     return response
 
 
