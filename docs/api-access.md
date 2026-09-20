@@ -14,13 +14,18 @@ environment:
 
 Generate something long and random (for example `openssl rand -base64 32`).
 A request carrying the key acts as an **admin**: the first admin user in
-Shelfmark's user database. Create an admin before relying on the key in
-OIDC-only installs. To rotate, change the variable and restart. Unset it and
-the feature is off.
+Shelfmark's user database. Create an admin before relying on the key in any
+install that has none yet (for example an OIDC-only install). Without an
+admin user, the key still authenticates as an admin identity with no user
+row, and routes that need one (requests, activity) answer 403. To rotate,
+change the variable and restart. Unset it and the feature is off. When the
+instance runs with no authentication configured (`AUTH_METHOD=none`), the
+key is simply unnecessary.
 
 ## Send the key
 
-Either header works; `Authorization` wins if both are present.
+Either header works, and both are checked, so the key can be sent in
+`X-Api-Key` behind a reverse proxy that sets its own `Authorization` header.
 
 ```bash
 curl -s -H "Authorization: Bearer $API_KEY" https://shelfmark.example.com/api/downloads/active
@@ -31,7 +36,11 @@ A request that carries the key is authenticated by the key alone. Session
 cookies are ignored and none are set. A bearer value that is not the configured
 key is ignored and the request continues with normal session authentication,
 so reverse proxies that forward their own tokens are unaffected; without a valid
-session such a request gets the usual `401 {"error": "Unauthorized"}`.
+session such a request gets the usual `401 {"error": "Unauthorized"}`. A
+database error while resolving the admin returns
+`500 {"error": "Authentication error"}` — never anonymous access.
+`/api/auth/check` reflects the browser session only and ignores the key, so
+use `/api/status` to verify a key.
 
 ## Examples
 
@@ -58,3 +67,6 @@ curl -s -H "Authorization: Bearer $API_KEY" https://shelfmark.example.com/api/st
 - The key is compared in constant time and is never logged.
 - Keyed requests never set cookies and ignore any cookie sent with them.
 - WebSocket (live activity) connections do not accept the key; poll `/api/status` instead.
+- The key is a root-equivalent credential: an admin can configure a custom
+  post-download script that the server executes, so treat it like a root
+  password and send it only over HTTPS.
