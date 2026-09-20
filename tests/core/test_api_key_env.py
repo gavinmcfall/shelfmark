@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import logging
 import os
 import sqlite3
 import tempfile
@@ -23,25 +24,25 @@ def user_db():
         yield db
 
 
-class TestExtractCandidate:
-    def test_bearer(self):
-        assert api_key.extract_api_key_candidate("Bearer abc", None) == "abc"
+class TestExtractCandidates:
+    def test_bearer_only(self):
+        assert api_key.extract_api_key_candidates("Bearer a", None) == ["a"]
 
     def test_bearer_case_insensitive_and_trimmed(self):
-        assert api_key.extract_api_key_candidate("bearer  abc ", None) == "abc"
+        assert api_key.extract_api_key_candidates("bearer  a ", None) == ["a"]
 
-    def test_non_bearer_scheme_ignored(self):
-        assert api_key.extract_api_key_candidate("Basic dXNlcjpwYXNz", None) is None
+    def test_x_api_key_only(self):
+        assert api_key.extract_api_key_candidates(None, "b") == ["b"]
 
-    def test_x_api_key(self):
-        assert api_key.extract_api_key_candidate(None, " abc ") == "abc"
+    def test_both_present(self):
+        assert api_key.extract_api_key_candidates("Bearer a", "b") == ["a", "b"]
 
-    def test_bearer_wins(self):
-        assert api_key.extract_api_key_candidate("Bearer a", "b") == "a"
+    def test_non_bearer_scheme_plus_x_api_key(self):
+        assert api_key.extract_api_key_candidates("Basic dXNlcjpwYXNz", "b") == ["b"]
 
     def test_empty(self):
-        assert api_key.extract_api_key_candidate("Bearer ", "") is None
-        assert api_key.extract_api_key_candidate(None, None) is None
+        assert api_key.extract_api_key_candidates("Bearer ", "") == []
+        assert api_key.extract_api_key_candidates(None, None) == []
 
 
 class TestMatches:
@@ -75,6 +76,7 @@ class TestFirstAdmin:
 
 @pytest.fixture(scope="module")
 def main_module():
+    """Import `shelfmark.main` with background startup disabled."""
     with patch("shelfmark.download.orchestrator.start"):
         import shelfmark.main as main
 
@@ -90,8 +92,32 @@ def wired(main_module, user_db, monkeypatch):
         yield main_module
 
 
+@pytest.fixture
+def real_user_db(main_module):
+    """The UserDB main_module's self-service routes closed over at registration time.
+
+    Unlike the isolated ``user_db``/``wired`` fixtures (a fresh temp DB
+    monkeypatched onto ``main_module.user_db``), routes registered by
+    ``register_self_user_routes`` keep their own reference to the UserDB
+    passed in at import time, so tests that need those routes to see admin
+    changes must write through this same instance. Any user created during
+    the test is deleted again on teardown so state doesn't leak between
+    tests sharing this module-scoped app.
+    """
+    db = main_module.user_db
+    existing_ids = {user["id"] for user in db.list_users()}
+    yield db
+    for user in db.list_users():
+        if user["id"] not in existing_ids:
+            db.delete_user(user["id"])
+
+
 def _bearer(value):
     return {"Authorization": f"Bearer {value}"}
+
+
+def _x_api_key(value):
+    return {"X-Api-Key": value}
 
 
 def _cookie_client(app, user, *, is_admin=False, permanent=False):
@@ -147,6 +173,17 @@ class TestKeyedRequests:
             == 200
         )
 
+    def test_wrong_bearer_plus_correct_x_api_key_authenticates(self, wired, user_db):
+        """A proxy's own Authorization header must not shadow a correct X-Api-Key."""
+        user_db.create_user(username="root", role="admin")
+        headers = {**_bearer("wrong"), **_x_api_key("s3cret")}
+        assert wired.app.test_client().get("/api/settings", headers=headers).status_code == 200
+
+    def test_correct_bearer_plus_wrong_x_api_key_authenticates(self, wired, user_db):
+        user_db.create_user(username="root", role="admin")
+        headers = {**_bearer("s3cret"), **_x_api_key("wrong")}
+        assert wired.app.test_client().get("/api/settings", headers=headers).status_code == 200
+
     def test_no_set_cookie_even_when_handler_dirties_session(self, wired, user_db, monkeypatch):
         user_db.create_user(username="root", role="admin")
         original = wired.app.view_functions["api_active_downloads"]
@@ -198,6 +235,32 @@ class TestMismatchFallsThrough:
         response = wired.app.test_client().get("/api/downloads/active", headers=_bearer("wrong"))
         assert response.status_code == 401
         assert response.get_json() == {"error": "Unauthorized"}
+
+    def test_mismatch_is_indistinguishable_from_no_credential(self, wired):
+        client = wired.app.test_client()
+        no_credential = client.get("/api/downloads/active")
+        with_wrong_bearer = client.get("/api/downloads/active", headers=_bearer("wrong"))
+
+        assert no_credential.status_code == with_wrong_bearer.status_code
+        assert no_credential.get_json() == with_wrong_bearer.get_json()
+
+        ignored_headers = {"date", "content-length", "server"}
+
+        def header_names(response):
+            return {name.lower() for name in response.headers.keys()} - ignored_headers
+
+        assert header_names(no_credential) == header_names(with_wrong_bearer)
+        assert "WWW-Authenticate" not in no_credential.headers
+        assert "WWW-Authenticate" not in with_wrong_bearer.headers
+
+    def test_mismatch_writes_no_log(self, wired, caplog):
+        with caplog.at_level(logging.INFO, logger="shelfmark"):
+            wired.app.test_client().get("/api/downloads/active", headers=_bearer("wrong"))
+
+        for record in caplog.records:
+            message = record.getMessage()
+            assert "API key" not in message
+            assert "wrong" not in message
 
     def test_mismatch_with_cookie_uses_cookie(self, wired, user_db):
         alice = user_db.create_user(username="alice")
@@ -263,3 +326,80 @@ class TestScopeAndModes:
                 .status_code
                 == 200
             )
+
+
+class TestIdentityAndRouting:
+    def test_deleted_first_admin_changes_identity(self, main_module, real_user_db, monkeypatch):
+        monkeypatch.setattr(api_key, "API_KEY", "s3cret")
+        root = real_user_db.create_user(username="root", role="admin")
+        second = real_user_db.create_user(username="second", role="admin")
+
+        with patch.object(main_module, "get_auth_mode", return_value="builtin"):
+            client = main_module.app.test_client()
+
+            response = client.get("/api/users/me/edit-context", headers=_bearer("s3cret"))
+            assert response.status_code == 200
+            assert response.get_json()["user"]["username"] == "root"
+
+            real_user_db.delete_user(root["id"])
+
+            response = client.get("/api/users/me/edit-context", headers=_bearer("s3cret"))
+            assert response.status_code == 200
+            assert response.get_json()["user"]["username"] == "second"
+
+            real_user_db.delete_user(second["id"])
+
+            # No admin row left at all; the key still authenticates a bare
+            # admin identity for routes that don't need a local user row.
+            response = client.get("/api/settings", headers=_bearer("s3cret"))
+            assert response.status_code == 200
+
+    def test_demoted_first_admin_changes_identity(self, main_module, real_user_db, monkeypatch):
+        monkeypatch.setattr(api_key, "API_KEY", "s3cret")
+        admin = real_user_db.create_user(username="root", role="admin")
+        real_user_db.update_user(admin["id"], role="user")
+
+        with patch.object(main_module, "get_auth_mode", return_value="builtin"):
+            client = main_module.app.test_client()
+
+            # Bare admin identity: no matching admin row, but still is_admin.
+            response = client.get("/api/settings", headers=_bearer("s3cret"))
+            assert response.status_code == 200
+
+            # No db_user_id in session, so the self-user guard rejects it.
+            response = client.get("/api/users/me/edit-context", headers=_bearer("s3cret"))
+            assert response.status_code == 403
+
+    def test_path_probes(self, wired, user_db):
+        user_db.create_user(username="root", role="admin")
+        client = wired.app.test_client()
+
+        # Flask routing is case-sensitive: /API/... doesn't match the /api/
+        # prefix the middleware checks, so it falls through to the SPA
+        # catch-all route instead of the JSON handler with elevated state.
+        response = client.get("/API/downloads/active", headers=_bearer("s3cret"))
+        assert response.status_code != 200 or response.content_type != "application/json"
+
+        # A trailing slash must not silently reach the handler either.
+        response = client.get("/api/downloads/active/", headers=_bearer("s3cret"))
+        assert response.status_code != 200 or not response.data
+
+        # A dot-segment path trick must not resolve to a live route.
+        response = client.get("/api/auth/../downloads/active", headers=_bearer("s3cret"))
+        assert response.status_code == 404
+
+    def test_keyed_post_reaches_mutating_route(self, wired, user_db, tmp_path, monkeypatch):
+        """A keyed write through an admin-only settings route succeeds end to end."""
+        import shelfmark.config.env as env_module
+
+        # Isolate the settings write from the shared session CONFIG_DIR so this
+        # test doesn't depend on (or pollute) other tests' persisted AUTH_METHOD.
+        monkeypatch.setattr(env_module, "CONFIG_DIR", str(tmp_path))
+        user_db.create_user(username="root", role="admin")
+
+        response = wired.app.test_client().put(
+            "/api/settings/security",
+            json={"AUTH_METHOD": "none", "PROXY_AUTH_LOGOUT_URL": ""},
+            headers=_bearer("s3cret"),
+        )
+        assert response.status_code == 200

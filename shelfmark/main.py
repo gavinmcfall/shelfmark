@@ -42,10 +42,9 @@ from shelfmark.config.settings import (
     _SUPPORTED_BOOK_LANGUAGE,
     migrate_audiobook_format_settings,
 )
-from shelfmark.core import api_key as api_key_module
+from shelfmark.core import api_key as api_key_module  # module access lets tests monkeypatch API_KEY
 from shelfmark.core import search_deadline
 from shelfmark.core.activity_view_state_service import ActivityViewStateService
-from shelfmark.core.api_key import extract_api_key_candidate, matches_api_key
 from shelfmark.core.auth_modes import (
     get_auth_check_admin_status,
     is_settings_or_onboarding_path,
@@ -680,10 +679,13 @@ _API_KEY_EXEMPT_PATHS = frozenset({"/api/health"})
 def api_key_auth_middleware() -> Response | tuple[Response, int] | None:
     """Authenticate requests that present the configured API_KEY.
 
-    A matching key authenticates the request as an admin for this request
-    only: any session cookie is ignored and none is written back. A value that
-    does not match is ignored so bearer tokens forwarded by reverse proxies
-    keep working; the request then continues on the normal session path.
+    Both Authorization: Bearer and X-Api-Key are checked, and either
+    matching authenticates the request as an admin for this request only:
+    any session cookie is ignored and none is written back. Checking both
+    means a reverse proxy's own Authorization header never shadows an
+    operator-supplied X-Api-Key. No matching candidate is ignored so bearer
+    tokens forwarded by reverse proxies keep working; the request then
+    continues on the normal session path.
     """
     if not request.path.startswith("/api/"):
         return None
@@ -692,13 +694,13 @@ def api_key_auth_middleware() -> Response | tuple[Response, int] | None:
     if not api_key_module.API_KEY:
         return None
 
-    candidate = extract_api_key_candidate(
+    candidates = api_key_module.extract_api_key_candidates(
         request.headers.get("Authorization"), request.headers.get("X-Api-Key")
     )
-    if candidate is None:
+    if not candidates:
         return None
 
-    if not matches_api_key(candidate):
+    if not any(api_key_module.matches_api_key(candidate) for candidate in candidates):
         return None
     if get_auth_mode() == "none":
         return None
@@ -874,14 +876,10 @@ def set_security_headers(response: Response) -> Response:
 def strip_cookie_for_api_key_requests(response: Response) -> Response:
     """Keyed requests never mint or refresh a session cookie, even if a handler dirties the session."""
     if g.get("api_key_auth"):
-        # Flask's session interface writes Set-Cookie *after* every
-        # after_request hook, driven by session.modified/permanent, so popping
-        # the header alone would just have it reappear. Setting `permanent`
-        # mutates the session dict (re-marking it modified), so it must be
-        # reset before `modified`, not after.
+        # Setting `permanent` mutates the session dict (re-marking it
+        # modified), so it must be reset before `modified`, not after.
         session.permanent = False
         session.modified = False
-        response.headers.pop("Set-Cookie", None)
     return response
 
 
