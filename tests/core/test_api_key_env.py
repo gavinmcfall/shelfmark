@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import importlib
 import os
+import sqlite3
 import tempfile
+from unittest.mock import patch
 
 import pytest
 
@@ -70,13 +73,6 @@ class TestFirstAdmin:
         assert user_db.get_first_admin()["id"] == root["id"]
 
 
-import importlib
-import sqlite3
-from unittest.mock import patch
-
-from shelfmark.core import api_key as api_key_module
-
-
 @pytest.fixture(scope="module")
 def main_module():
     with patch("shelfmark.download.orchestrator.start"):
@@ -89,7 +85,7 @@ def main_module():
 @pytest.fixture
 def wired(main_module, user_db, monkeypatch):
     monkeypatch.setattr(main_module, "user_db", user_db)
-    monkeypatch.setattr(api_key_module, "API_KEY", "s3cret")
+    monkeypatch.setattr(api_key, "API_KEY", "s3cret")
     with patch.object(main_module, "get_auth_mode", return_value="builtin"):
         yield main_module
 
@@ -133,7 +129,7 @@ class TestKeyedRequests:
 
     def test_match_no_user_db(self, main_module, monkeypatch):
         monkeypatch.setattr(main_module, "user_db", None)
-        monkeypatch.setattr(api_key_module, "API_KEY", "s3cret")
+        monkeypatch.setattr(api_key, "API_KEY", "s3cret")
         with patch.object(main_module, "get_auth_mode", return_value="builtin"):
             assert (
                 main_module.app.test_client()
@@ -172,6 +168,15 @@ class TestKeyedRequests:
         client = _cookie_client(wired.app, alice)
         assert client.get("/api/settings", headers=_bearer("s3cret")).status_code == 200
 
+    def test_matched_key_leaves_browser_cookie_usable(self, wired, user_db):
+        user_db.create_user(username="root", role="admin")
+        alice = user_db.create_user(username="alice")
+        client = _cookie_client(wired.app, alice)
+        assert client.get("/api/settings", headers=_bearer("s3cret")).status_code == 200
+
+        assert client.get("/api/downloads/active").status_code == 200
+        assert client.get("/api/settings").status_code == 403
+
     def test_security_headers_present(self, wired, user_db):
         user_db.create_user(username="root", role="admin")
         response = wired.app.test_client().get("/api/downloads/active", headers=_bearer("s3cret"))
@@ -200,23 +205,28 @@ class TestMismatchFallsThrough:
         assert client.get("/api/downloads/active", headers=_bearer("wrong")).status_code == 200
         assert client.get("/api/settings", headers=_bearer("wrong")).status_code == 403
 
-    def test_mismatch_never_refreshes_or_clears_permanent_cookie(self, wired, user_db):
+    def test_mismatch_leaves_browser_session_untouched(self, wired, user_db):
         alice = user_db.create_user(username="alice")
         client = _cookie_client(wired.app, alice, permanent=True)
         response = client.get("/api/downloads/active", headers=_bearer("wrong"))
         assert response.status_code == 200
-        assert "Set-Cookie" not in response.headers
         assert client.get("/api/downloads/active").status_code == 200
 
     def test_unset_key_is_noop(self, main_module, user_db, monkeypatch):
         monkeypatch.setattr(main_module, "user_db", user_db)
-        monkeypatch.setattr(api_key_module, "API_KEY", "")
+        monkeypatch.setattr(api_key, "API_KEY", "")
         with patch.object(main_module, "get_auth_mode", return_value="builtin"):
             response = main_module.app.test_client().get(
                 "/api/downloads/active", headers=_bearer("s3cret")
             )
-        assert response.status_code == 401
-        assert response.get_json() == {"error": "Unauthorized"}
+            assert response.status_code == 401
+            assert response.get_json() == {"error": "Unauthorized"}
+
+            alice = user_db.create_user(username="alice")
+            client = _cookie_client(main_module.app, alice, permanent=True)
+            cookie_response = client.get("/api/downloads/active", headers=_bearer("s3cret"))
+        assert cookie_response.status_code == 200
+        assert "Set-Cookie" in cookie_response.headers
 
 
 class TestScopeAndModes:
@@ -231,7 +241,7 @@ class TestScopeAndModes:
 
     def test_none_mode_noop(self, main_module, user_db, monkeypatch):
         monkeypatch.setattr(main_module, "user_db", user_db)
-        monkeypatch.setattr(api_key_module, "API_KEY", "s3cret")
+        monkeypatch.setattr(api_key, "API_KEY", "s3cret")
         with patch.object(main_module, "get_auth_mode", return_value="none"):
             assert (
                 main_module.app.test_client()
@@ -244,7 +254,7 @@ class TestScopeAndModes:
         self, main_module, user_db, monkeypatch
     ):
         monkeypatch.setattr(main_module, "user_db", user_db)
-        monkeypatch.setattr(api_key_module, "API_KEY", "s3cret")
+        monkeypatch.setattr(api_key, "API_KEY", "s3cret")
         user_db.create_user(username="root", role="admin", auth_source="proxy")
         with patch.object(main_module, "get_auth_mode", return_value="proxy"):
             assert (

@@ -42,6 +42,7 @@ from shelfmark.config.settings import (
     _SUPPORTED_BOOK_LANGUAGE,
     migrate_audiobook_format_settings,
 )
+from shelfmark.core import api_key as api_key_module
 from shelfmark.core import search_deadline
 from shelfmark.core.activity_view_state_service import ActivityViewStateService
 from shelfmark.core.api_key import extract_api_key_candidate, matches_api_key
@@ -688,15 +689,14 @@ def api_key_auth_middleware() -> Response | tuple[Response, int] | None:
         return None
     if request.path in _API_KEY_EXEMPT_PATHS or request.path.startswith(_API_KEY_EXEMPT_PREFIXES):
         return None
+    if not api_key_module.API_KEY:
+        return None
 
     candidate = extract_api_key_candidate(
         request.headers.get("Authorization"), request.headers.get("X-Api-Key")
     )
     if candidate is None:
         return None
-
-    # Any bearer attempt must never refresh or clear the browser's session cookie.
-    g.api_key_attempt = True
 
     if not matches_api_key(candidate):
         return None
@@ -872,8 +872,8 @@ def set_security_headers(response: Response) -> Response:
 
 @app.after_request
 def strip_cookie_for_api_key_requests(response: Response) -> Response:
-    """Bearer attempts never mint or refresh a session cookie, even if a handler dirties the session."""
-    if g.get("api_key_attempt"):
+    """Keyed requests never mint or refresh a session cookie, even if a handler dirties the session."""
+    if g.get("api_key_auth"):
         # Flask's session interface writes Set-Cookie *after* every
         # after_request hook, driven by session.modified/permanent, so popping
         # the header alone would just have it reappear. Setting `permanent`
